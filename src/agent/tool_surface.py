@@ -3,17 +3,22 @@
 
 from __future__ import annotations
 
-import contextvars
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from dataclasses import replace
 from typing import Any, Dict, Optional
 
 from src.agent.tools.execution import (
     ToolAccessContext,
-    _guard_tool_stock_scope,
+    ToolExecutionCancelled,
+    ToolExecutionDeadlineExceeded,
+    _resolve_tool_stock_access,
+    bind_tool_execution_context,
     build_tool_audit,
+    check_tool_execution,
+    redact_external_tool_result,
     redact_diagnostic_value,
+    reset_tool_execution_context,
     serialize_tool_result,
 )
 from src.agent.tools.registry import (
@@ -44,15 +49,23 @@ class ToolSurface:
     def __init__(self, registry: ToolRegistry) -> None:
         self._registry = registry
 
-    def list_tools(self, format: str = "public") -> list[dict]:
+    @classmethod
+    def empty(cls) -> "ToolSurface":
+        """Return an empty Phase 6a surface for protocol-only preflight work."""
+        return cls(ToolRegistry())
+
+    def list_tools(self, format: str = "public", *, cancellation_safe_only: bool = False) -> list[dict]:
         """List tools in a stable schema format."""
         normalized = (format or "public").strip().lower()
+        tools = self._registry.list_tools()
+        if cancellation_safe_only:
+            tools = [tool_def for tool_def in tools if tool_def.policy.cancellation_safe]
         if normalized == "openai":
-            return self._registry.to_openai_tools()
+            return [tool_def.to_openai_tool() for tool_def in tools]
         if normalized == "public":
-            return [tool_def.to_public_descriptor() for tool_def in self._registry.list_tools()]
+            return [tool_def.to_public_descriptor() for tool_def in tools]
         if normalized == "mcp_descriptor":
-            return [tool_def.to_mcp_descriptor() for tool_def in self._registry.list_tools()]
+            return [tool_def.to_mcp_descriptor() for tool_def in tools]
         raise ValueError(f"Unsupported tool surface format: {format}")
 
     def execute_tool(
@@ -114,6 +127,7 @@ class ToolSurface:
             )
 
         guard_result = None
+        access = None
         if _requires_stock_scope(tool_def):
             if ctx.stock_scope is None:
                 return self._error_result(
@@ -129,7 +143,7 @@ class ToolSurface:
                     },
                     arguments=arguments,
                 )
-            guard_result = _guard_tool_stock_scope(
+            guard_result, access = _resolve_tool_stock_access(
                 self._registry,
                 tool_name,
                 arguments,
@@ -139,8 +153,14 @@ class ToolSurface:
             result_text = serialize_tool_result(guard_result)
             return self._error_result(
                 tool_name=tool_name,
-                code="stock_scope_violation",
-                message="Tool call is outside the allowed stock scope.",
+                code=guard_result["error"],
+                message=("Accepted stock identity cannot be reliably validated."
+                         if guard_result["error"] == "stock_identity_unavailable"
+                         else "Tool does not support this target."
+                         if guard_result["error"] == "stock_tool_unsupported"
+                         else "Tool target applicability is not declared."
+                         if guard_result["error"] == "stock_tool_contract_unknown"
+                         else "Tool call is outside the allowed stock scope."),
                 started_at=started_at,
                 context=ctx,
                 retriable=False,
@@ -154,25 +174,50 @@ class ToolSurface:
             )
 
         timeout = ctx.timeout_seconds
+        if (
+            ctx.deadline is None
+            and timeout is not None
+            and timeout > 0
+        ):
+            ctx = replace(ctx, deadline=time.monotonic() + float(timeout))
+        controlled_execution = ctx.cancel_event is not None or ctx.deadline is not None
+        if controlled_execution and not tool_def.policy.cancellation_safe:
+            return self._error_result(
+                tool_name=tool_name,
+                code="cancellation_unsupported",
+                message="Tool is not available to runtimes that require bounded cancellation.",
+                started_at=started_at,
+                context=ctx,
+                retriable=False,
+                arguments=arguments,
+            )
+
         try:
-            if timeout is not None and timeout > 0:
-                result = _execute_with_timeout(tool_def, arguments, float(timeout))
+            if access is not None:
+                ctx = replace(ctx, stock_identity=access.identity, analysis_target=access.target)
+                arguments = dict(arguments, stock_code=access.identity.stock_code)
+            if controlled_execution or access is not None:
+                result = _execute_with_control(tool_def, arguments, ctx)
             else:
                 result = tool_def.handler(**arguments)
-        except FuturesTimeoutError:
-            timeout_label = f"{float(timeout or 0):.2f}s"
+        except ToolExecutionCancelled:
+            return self._error_result(
+                tool_name=tool_name,
+                code="cancelled",
+                message="Tool execution was cancelled.",
+                started_at=started_at,
+                context=ctx,
+                retriable=False,
+                arguments=arguments,
+            )
+        except ToolExecutionDeadlineExceeded:
             return self._error_result(
                 tool_name=tool_name,
                 code="timeout",
-                message=f"Tool execution timed out after {timeout_label}.",
+                message="Tool execution exceeded the Agent deadline.",
                 started_at=started_at,
                 context=ctx,
-                retriable=True,
-                details={
-                    "timeout_seconds": float(timeout or 0),
-                    "cancel_requested": True,
-                    "handler_may_continue": True,
-                },
+                retriable=False,
                 arguments=arguments,
             )
         except Exception:
@@ -187,7 +232,11 @@ class ToolSurface:
             )
 
         try:
-            result_text = serialize_tool_result(result)
+            result_text = (
+                redact_external_tool_result(result)
+                if ctx.redact_result
+                else serialize_tool_result(result)
+            )
         except Exception:
             return self._error_result(
                 tool_name=tool_name,
@@ -276,17 +325,19 @@ class ToolSurface:
         }
 
 
-def _execute_with_timeout(tool_def: ToolDefinition, arguments: Dict[str, Any], timeout: float) -> Any:
-    pool = ThreadPoolExecutor(max_workers=1)
-    ctx = contextvars.copy_context()
-    future = pool.submit(ctx.run, tool_def.handler, **arguments)
+def _execute_with_control(
+    tool_def: ToolDefinition,
+    arguments: Dict[str, Any],
+    context: ToolAccessContext,
+) -> Any:
+    token = bind_tool_execution_context(context)
     try:
-        return future.result(timeout=timeout)
-    except FuturesTimeoutError:
-        future.cancel()
-        raise
+        check_tool_execution()
+        result = tool_def.handler(**arguments)
+        check_tool_execution()
+        return result
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        reset_tool_execution_context(token)
 
 
 def _validate_arguments(tool_def: ToolDefinition, arguments: Any) -> Optional[str]:

@@ -43,6 +43,9 @@ class ToolPolicy:
     permissions: List[str] = field(default_factory=list)
     policy_status: str = "unknown"
     scope_dimensions: List[str] = field(default_factory=list)
+    cancellation_safe: bool = False
+    timeout_seconds: Optional[float] = None
+    supported_asset_types: Optional[tuple[str, ...]] = None
 
     @classmethod
     def unknown(cls) -> "ToolPolicy":
@@ -56,6 +59,9 @@ class ToolPolicy:
         side_effects: Optional[List[str]] = None,
         permissions: Optional[List[str]] = None,
         scope_dimensions: Optional[List[str]] = None,
+        cancellation_safe: bool = False,
+        timeout_seconds: Optional[float] = None,
+        supported_asset_types: Optional[tuple[str, ...]] = None,
     ) -> "ToolPolicy":
         return cls(
             read_only=read_only,
@@ -63,6 +69,9 @@ class ToolPolicy:
             permissions=list(permissions or []),
             policy_status="declared",
             scope_dimensions=list(scope_dimensions or []),
+            cancellation_safe=bool(cancellation_safe),
+            timeout_seconds=timeout_seconds,
+            supported_asset_types=supported_asset_types,
         )
 
     def to_public_dict(self) -> Dict[str, Any]:
@@ -71,6 +80,7 @@ class ToolPolicy:
             "side_effects": list(self.side_effects),
             "permissions": list(self.permissions),
             "policy_status": self.policy_status,
+            "cancellation_safe": self.cancellation_safe,
         }
 
 
@@ -81,8 +91,9 @@ class ToolDefinition:
     description: str
     parameters: List[ToolParameter]
     handler: Callable
-    category: str = "data"  # data | analysis | search | action
+    category: str = "data"  # data | analysis | search | action | market
     policy: ToolPolicy = field(default_factory=ToolPolicy.unknown)
+    timeout_seconds: Optional[float] = None  # Optional per-tool execution timeout
 
     # ----- Multi-provider schema converters -----
 
@@ -168,8 +179,9 @@ class ToolRegistry:
         registry.execute("get_realtime_quote", stock_code="600519")
     """
 
-    def __init__(self):
+    def __init__(self, category_timeout_map: Optional[Dict[str, float]] = None):
         self._tools: Dict[str, ToolDefinition] = {}
+        self._category_timeouts: Dict[str, float] = dict(category_timeout_map or {})
 
     # ----- Registration -----
 
@@ -210,6 +222,24 @@ class ToolRegistry:
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools
+
+    def category_default_timeout(self, category: str) -> Optional[float]:
+        """Return the configured default timeout (seconds) for a tool category.
+
+        Returns ``None`` when no default is configured, letting the caller fall
+        back to the global ``tool_call_timeout_seconds`` budget.
+        """
+        return self._category_timeouts.get(category)
+
+    @property
+    def category_timeout_map(self) -> Dict[str, float]:
+        """Return a copy of the per-category default timeout map.
+
+        Used by :meth:`ToolRegistry` consumers that build a filtered registry
+        (e.g. ``BaseAgent._filtered_registry``) so the category ceilings survive
+        the subset copy (review OR-COM-7f3d3f5b).
+        """
+        return dict(self._category_timeouts)
 
     # ----- Schema generation -----
 
@@ -311,6 +341,7 @@ def tool(
     parameters: Optional[List[ToolParameter]] = None,
     registry: Optional[ToolRegistry] = None,
     policy: Optional[ToolPolicy] = None,
+    timeout_seconds: Optional[float] = None,
 ):
     """Decorator to register a function as an agent tool.
 
@@ -329,13 +360,29 @@ def tool(
         if params is None:
             params = _infer_parameters(func)
 
+        # Single source of truth for per-tool timeout is
+        # ``ToolDefinition.timeout_seconds`` (the field ``runner`` actually
+        # reads).  If the caller supplied a ``timeout_seconds`` via the policy
+        # but omitted the explicit ``@tool(timeout_seconds=...)`` argument, fold
+        # the policy value in here so the two never diverge.
+        effective_timeout = timeout_seconds
+        resolved_policy = policy or ToolPolicy.unknown()
+        if effective_timeout is None and getattr(resolved_policy, "timeout_seconds", None) is not None:
+            effective_timeout = resolved_policy.timeout_seconds
+            logger.debug(
+                "Tool '%s': using ToolPolicy.timeout_seconds=%s as the effective per-tool timeout",
+                name,
+                effective_timeout,
+            )
+
         tool_def = ToolDefinition(
             name=name,
             description=description,
             parameters=params,
             handler=func,
             category=category,
-            policy=policy or ToolPolicy.unknown(),
+            policy=resolved_policy,
+            timeout_seconds=effective_timeout,
         )
 
         target_registry = registry or get_default_registry()

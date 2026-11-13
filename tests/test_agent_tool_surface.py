@@ -4,13 +4,21 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from src.agent.stock_scope import StockScope
 from src.agent.tool_surface import ToolSurface
-from src.agent.tools.execution import ToolAccessContext
+from src.agent.tools.execution import ToolAccessContext, check_tool_execution
 from src.agent.tools.registry import ToolDefinition, ToolParameter, ToolPolicy, ToolRegistry
+
+
+def _single_tool_registry(tool: ToolDefinition) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(tool)
+    return registry
 
 
 def _registry_with_echo(executed=None) -> ToolRegistry:
@@ -65,11 +73,140 @@ def test_public_descriptor_does_not_expose_handler_and_includes_policy_scope() -
     encoded = json.dumps(descriptor, ensure_ascii=False)
 
     assert descriptor["policy"]["policy_status"] == "declared"
+    assert descriptor["policy"]["cancellation_safe"] is False
     assert descriptor["scope"]["scope_dimensions"] == ["stock"]
     assert descriptor["scope"]["requires_stock_scope"] is True
     assert "handler" not in encoded
     assert "callable" not in encoded
     assert "<function" not in encoded
+
+
+def test_cancellation_safe_filter_only_lists_explicitly_safe_tools() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="safe",
+            description="Safe",
+            parameters=[],
+            handler=lambda: None,
+            policy=ToolPolicy.declared(read_only=True, cancellation_safe=True),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="unsafe",
+            description="Unsafe",
+            parameters=[],
+            handler=lambda: None,
+            policy=ToolPolicy.declared(read_only=True),
+        )
+    )
+
+    surface = ToolSurface(registry)
+
+    assert [item["name"] for item in surface.list_tools("public")] == ["safe", "unsafe"]
+    assert [
+        item["name"]
+        for item in surface.list_tools("public", cancellation_safe_only=True)
+    ] == ["safe"]
+
+
+def test_controlled_execution_rejects_tool_without_cancellation_contract() -> None:
+    called = False
+
+    def handler():
+        nonlocal called
+        called = True
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="unsafe",
+            description="Unsafe",
+            parameters=[],
+            handler=handler,
+            policy=ToolPolicy.declared(read_only=True),
+        )
+    )
+
+    result = ToolSurface(registry).execute_tool(
+        "unsafe",
+        {},
+        ToolAccessContext(cancel_event=threading.Event()),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "cancellation_unsupported"
+    assert called is False
+
+
+def test_cancellation_safe_handler_exits_before_controlled_call_returns() -> None:
+    entered = threading.Event()
+    cancel_event = threading.Event()
+    results = []
+
+    def handler():
+        entered.set()
+        while True:
+            check_tool_execution()
+            cancel_event.wait(0.01)
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="cooperative",
+            description="Cooperative",
+            parameters=[],
+            handler=handler,
+            policy=ToolPolicy.declared(read_only=True, cancellation_safe=True),
+        )
+    )
+    thread = threading.Thread(
+        target=lambda: results.append(
+            ToolSurface(registry).execute_tool(
+                "cooperative",
+                {},
+                ToolAccessContext(cancel_event=cancel_event),
+            )
+        )
+    )
+
+    thread.start()
+    assert entered.wait(timeout=1)
+    cancel_event.set()
+    thread.join(timeout=1)
+
+    assert thread.is_alive() is False
+    assert results[0]["error"]["code"] == "cancelled"
+
+
+def test_controlled_deadline_is_checked_before_safe_handler() -> None:
+    called = False
+
+    def handler():
+        nonlocal called
+        called = True
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="safe",
+            description="Safe",
+            parameters=[],
+            handler=handler,
+            policy=ToolPolicy.declared(read_only=True, cancellation_safe=True),
+        )
+    )
+
+    result = ToolSurface(registry).execute_tool(
+        "safe",
+        {},
+        ToolAccessContext(deadline=time.monotonic() - 1),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "timeout"
+    assert called is False
 
 
 def test_openai_schema_is_structurally_equal_to_registry_output() -> None:
@@ -277,6 +414,154 @@ def test_declared_stock_scope_requires_explicit_stock_context_before_handler() -
     assert result["error"]["code"] == "stock_scope_violation"
     assert result["error"]["details"]["reason"] == "stock_scope_required"
     assert calls == []
+
+
+def _register_quote_tool(registry: ToolRegistry) -> None:
+    registry.register(
+        ToolDefinition(
+            name="quote",
+            description="Quote",
+            parameters=[ToolParameter(name="stock_code", type="string", description="Stock")],
+            handler=lambda stock_code: {"code": stock_code},
+            policy=ToolPolicy.declared(
+                read_only=True,
+                permissions=["market_data:read"],
+                scope_dimensions=["stock"],
+            ),
+        )
+    )
+
+
+def test_index_canonical_passes_and_bare_same_code_rejected_with_default_registry() -> None:
+    # Real ToolSurface WITHOUT any index-registry injection: the guard resolves
+    # the default bundled registry once, so an explicit index scope
+    # (`sh000016`) admits its canonical/dotted alias forms but rejects the bare
+    # same-code stock (`000016`) with the existing `stock_scope_violation`.
+    tool_registry = ToolRegistry()
+    _register_quote_tool(tool_registry)
+    surface = ToolSurface(tool_registry)
+    scope = StockScope(expected_stock_code="sh000016", allowed_stock_codes={"sh000016"})
+
+    for alias in ("sh000016", "000016.SH", "SH000016"):
+        ok = surface.execute_tool(
+            "quote",
+            {"stock_code": alias},
+            ToolAccessContext(stock_scope=scope),
+        )
+        assert ok["ok"] is True, alias
+        assert ok["result"] == {"code": alias}
+
+    rejected = surface.execute_tool(
+        "quote",
+        {"stock_code": "000016"},
+        ToolAccessContext(stock_scope=scope),
+    )
+    assert rejected["ok"] is False
+    assert rejected["error"]["code"] == "stock_scope_violation"
+    assert rejected["error"]["details"]["requested_stock_code"] == "000016"
+
+
+def test_tool_cache_key_isolates_index_canonical_from_bare_same_code() -> None:
+    from src.agent.tools.execution import _build_tool_cache_key
+
+    index_key = _build_tool_cache_key("quote", {"stock_code": "sh000016"})
+    alias_key = _build_tool_cache_key("quote", {"stock_code": "000016.SH"})
+    bare_key = _build_tool_cache_key("quote", {"stock_code": "000016"})
+
+    assert index_key is not None
+    assert index_key == alias_key
+    assert index_key != bare_key
+    # No stock_code in the arguments -> legacy key, no registry resolution.
+    assert _build_tool_cache_key("quote", {"limit": 5}) == "quote:{\"limit\": 5}"
+
+
+def test_normalize_tool_stock_code_registry_seam() -> None:
+    from src.agent.tools.execution import _normalize_tool_stock_code
+    from src.services.stock_list_parser import IndexEntry, IndexRegistry
+
+    registry = IndexRegistry(
+        [
+            IndexEntry(
+                bare_code="000016",
+                exchange="SH",
+                canonical_id="sh000016",
+                display_name="上证50",
+                aliases=("000016.SH",),
+            )
+        ]
+    )
+    assert _normalize_tool_stock_code("000016.SH", registry) == "sh000016"
+    assert _normalize_tool_stock_code("sh000016", registry) == "sh000016"
+    assert _normalize_tool_stock_code("SH000016", registry) == "sh000016"
+    # Explicit index token with an EMPTY registry falls open to stock semantics.
+    assert _normalize_tool_stock_code("sh000016", IndexRegistry([])) == "000016"
+    # Direct call without a registry keeps the legacy stock identity byte-for-byte.
+    assert _normalize_tool_stock_code("000016.SH") == "000016"
+
+
+def test_guard_tool_stock_scope_registry_injection_seam() -> None:
+    from src.agent.tools.execution import _guard_tool_stock_scope
+    from src.services.stock_list_parser import IndexEntry, IndexRegistry
+
+    index_registry = IndexRegistry(
+        [
+            IndexEntry(
+                bare_code="000016",
+                exchange="SH",
+                canonical_id="sh000016",
+                display_name="上证50",
+                aliases=("000016.SH",),
+            )
+        ]
+    )
+    tool_registry = ToolRegistry()
+    _register_quote_tool(tool_registry)
+    scope = StockScope(expected_stock_code="sh000016", allowed_stock_codes={"sh000016"})
+
+    assert (
+        _guard_tool_stock_scope(
+            tool_registry,
+            "quote",
+            {"stock_code": "sh000016"},
+            scope,
+            index_registry=index_registry,
+        )
+        is None
+    )
+    violation = _guard_tool_stock_scope(
+        tool_registry,
+        "quote",
+        {"stock_code": "000016"},
+        scope,
+        index_registry=index_registry,
+    )
+    assert violation is not None
+    assert violation["error"] == "stock_scope_violation"
+    assert violation["requested_stock_code"] == "000016"
+
+
+def test_tool_guard_and_cache_registry_failure_use_legacy_stock_semantics() -> None:
+    from src.agent.tools.execution import _build_tool_cache_key
+
+    tool_registry = ToolRegistry()
+    _register_quote_tool(tool_registry)
+    surface = ToolSurface(tool_registry)
+    scope = StockScope(expected_stock_code="sh000016", allowed_stock_codes={"sh000016"})
+
+    with patch(
+        "src.services.stock_list_parser.default_index_registry",
+        side_effect=RuntimeError("registry unavailable"),
+    ):
+        result = surface.execute_tool(
+            "quote",
+            {"stock_code": "000016.SH"},
+            ToolAccessContext(stock_scope=scope),
+        )
+        alias_key = _build_tool_cache_key("quote", {"stock_code": "000016.SH"})
+        bare_key = _build_tool_cache_key("quote", {"stock_code": "000016"})
+
+    assert result["ok"] is True
+    assert alias_key == bare_key
 
 
 def test_handler_error_is_structured_without_traceback() -> None:
@@ -526,6 +811,76 @@ def test_default_production_registry_has_supported_declared_policies() -> None:
     assert registry.validate_tool_policies(strict=True) == []
 
 
+def test_default_production_registry_only_exposes_bounded_tools_to_codex() -> None:
+    from src.agent.factory import get_tool_registry
+
+    safe_names = {
+        item["name"]
+        for item in ToolSurface(get_tool_registry()).list_tools(
+            "public",
+            cancellation_safe_only=True,
+        )
+    }
+
+    assert safe_names == {
+        "get_analysis_context",
+        "get_skill_backtest_summary",
+        "get_strategy_backtest_summary",
+    }
+
+
+def test_analysis_context_honors_cancellation_after_database_read(monkeypatch) -> None:
+    from src.agent.tools import data_tools
+
+    cancel_event = threading.Event()
+
+    class _Database:
+        def get_analysis_context(self, _stock_code):
+            cancel_event.set()
+            return {"code": "600519"}
+
+    monkeypatch.setattr(data_tools, "_get_db", lambda: _Database())
+
+    result = ToolSurface(_single_tool_registry(data_tools.get_analysis_context_tool)).execute_tool(
+        "get_analysis_context",
+        {"stock_code": "600519"},
+        ToolAccessContext(
+            stock_scope=StockScope(
+                expected_stock_code="600519",
+                allowed_stock_codes={"600519"},
+            ),
+            cancel_event=cancel_event,
+        ),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "cancelled"
+
+
+def test_backtest_summary_honors_cancellation_after_database_read(monkeypatch) -> None:
+    from src.agent.tools import backtest_tools
+
+    cancel_event = threading.Event()
+
+    class _BacktestService:
+        def get_summary(self, **_kwargs):
+            cancel_event.set()
+            return {"scope": "overall"}
+
+    monkeypatch.setattr(backtest_tools, "_get_backtest_service", lambda: _BacktestService())
+
+    result = ToolSurface(
+        _single_tool_registry(backtest_tools.get_strategy_backtest_summary_tool)
+    ).execute_tool(
+        "get_strategy_backtest_summary",
+        {},
+        ToolAccessContext(cancel_event=cancel_event),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "cancelled"
+
+
 def test_future_scope_context_fields_do_not_block_undeclared_tools() -> None:
     result = ToolSurface(_registry_with_echo()).execute_tool(
         "echo",
@@ -540,14 +895,22 @@ def test_future_scope_context_fields_do_not_block_undeclared_tools() -> None:
     assert result["ok"] is True
 
 
-def test_timeout_returns_promptly_without_waiting_for_handler_shutdown() -> None:
+def test_timeout_does_not_return_while_handler_is_still_running() -> None:
+    finished = threading.Event()
+
+    def slow_handler():
+        time.sleep(0.4)
+        finished.set()
+        return {"done": True}
+
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
             name="slow",
             description="Slow",
             parameters=[],
-            handler=lambda: (time.sleep(0.4), {"done": True})[1],
+            handler=slow_handler,
+            policy=ToolPolicy.declared(read_only=True, cancellation_safe=True),
         )
     )
 
@@ -560,8 +923,8 @@ def test_timeout_returns_promptly_without_waiting_for_handler_shutdown() -> None
 
     assert result["ok"] is False
     assert result["error"]["code"] == "timeout"
-    assert result["error"]["details"]["handler_may_continue"] is True
-    assert time.time() - started < 0.2
+    assert finished.is_set()
+    assert time.time() - started >= 0.35
 
 
 def test_max_result_bytes_truncates_public_payload_and_marks_diagnostics() -> None:
@@ -636,3 +999,32 @@ def test_stock_scope_no_longer_imports_runner_for_normalization() -> None:
     source = Path("src/agent/stock_scope.py").read_text(encoding="utf-8")
 
     assert "from src.agent.runner import _normalize_tool_stock_code" not in source
+
+
+def test_redacted_tool_result_hides_secrets_and_local_paths() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="redaction_probe",
+            description="Return a secret-shaped payload.",
+            parameters=[],
+            handler=lambda: {
+                "token": "secret-value",
+                "path": "/Users/alice/private.txt",
+                "value": "safe",
+            },
+            category="data",
+            policy=ToolPolicy.declared(read_only=True),
+        )
+    )
+    result = ToolSurface(registry).execute_tool(
+        "redaction_probe",
+        {},
+        ToolAccessContext(redact_result=True, max_result_bytes=1024),
+    )
+
+    assert result["ok"] is True
+    assert "secret-value" not in result["result_text"]
+    assert "/Users/alice" not in result["result_text"]
+    assert "[REDACTED]" in result["result_text"]
+    assert "safe" in result["result_text"]

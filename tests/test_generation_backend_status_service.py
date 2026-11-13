@@ -62,7 +62,7 @@ def _litellm_effective_map(api_key: str = "sk-secret-value") -> dict:
     return {
         "GENERATION_BACKEND": "litellm",
         "GENERATION_FALLBACK_BACKEND": "",
-        "LITELLM_MODEL": "openai/gpt-5.5",
+        "LITELLM_MODEL": "openai/gpt-6.1-sol",
         "OPENAI_API_KEY": api_key,
     }
 
@@ -278,7 +278,7 @@ def test_litellm_aihubmix_key_builds_openai_legacy_route() -> None:
     service = GenerationBackendStatusService(
         effective_map={
             "GENERATION_BACKEND": "litellm",
-            "LITELLM_MODEL": "openai/gpt-5.5",
+            "LITELLM_MODEL": "openai/gpt-6.1-sol",
             "AIHUBMIX_KEY": "sk-aihubmix-secret",
         }
     )
@@ -302,7 +302,7 @@ def test_litellm_legacy_key_infers_runtime_model_for_smoke_config() -> None:
     payload = service.smoke_test(mode="json")
 
     assert payload["success"] is True
-    assert _CapturingAnalyzer.configs[-1].litellm_model == "gemini/gemini-3.1-pro-preview"
+    assert _CapturingAnalyzer.configs[-1].litellm_model == "gemini/gemini-3.6-flash"
 
 
 def test_litellm_validation_issues_are_not_available() -> None:
@@ -386,3 +386,187 @@ def test_litellm_channel_route_is_used_for_status_and_smoke_config() -> None:
     assert config.llm_model_list[0]["model_name"] == "openai/gpt-4o-mini"
     assert config.llm_model_list[0]["litellm_params"]["api_key"] == "sk-remote"
     assert config.llm_model_list[0]["litellm_params"]["api_base"] == "https://api.example.com/v1"
+
+
+def test_modelflare_minimal_channel_is_available_for_status_and_smoke() -> None:
+    _CapturingAnalyzer.configs = []
+    effective_map = {
+        "MODELFLARE_KEY": "sk-test",
+    }
+    service = GenerationBackendStatusService(
+        effective_map=effective_map,
+        analyzer_factory=lambda config: _CapturingAnalyzer(config),
+    )
+    assert service.get_status()["primary"]["available"] is True
+    assert service.smoke_test(mode="json")["success"] is True
+    config = _CapturingAnalyzer.configs[-1]
+    assert config.litellm_model == "openai/gpt-6.1-sol"
+    assert config.llm_model_list[0]["litellm_params"]["api_base"] == "https://modelflare.dev/v1"
+    assert "LLM_MODELFLARE_BASE_URL" not in effective_map
+
+
+def test_modelflare_global_model_routes_are_used_without_channel_model_list() -> None:
+    service = GenerationBackendStatusService(effective_map={
+        "LLM_CHANNELS": "modelflare", "LLM_MODELFLARE_API_KEY": "sk-test",
+        "LITELLM_MODEL": "openai/account-model", "LITELLM_FALLBACK_MODELS": "openai/fallback-model",
+    }, analyzer_factory=lambda config: _CapturingAnalyzer(config))
+    assert service.get_status()["primary"]["available"] is True
+    assert service.smoke_test(mode="json")["success"] is True
+    config = _CapturingAnalyzer.configs[-1]
+    assert [entry["model_name"] for entry in config.llm_model_list] == ["openai/account-model", "openai/fallback-model"]
+
+
+def test_litellm_channel_route_preserves_responses_surface_for_smoke_config() -> None:
+    _CapturingAnalyzer.configs = []
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "litellm",
+            "LLM_CHANNELS": "draft",
+            "LLM_DRAFT_PROTOCOL": "openai",
+            "LLM_DRAFT_API_SURFACE": "responses",
+            "LLM_DRAFT_BASE_URL": "https://api.example.com/v1",
+            "LLM_DRAFT_API_KEY": "sk-draft",
+            "LLM_DRAFT_MODELS": "gpt-5.6-sol",
+        },
+        analyzer_factory=lambda config: _CapturingAnalyzer(config),
+    )
+
+    status = service.get_status()
+    smoke = service.smoke_test(mode="json")
+
+    assert status["primary"]["available"] is True
+    assert smoke["success"] is True
+    config = _CapturingAnalyzer.configs[-1]
+    assert config.litellm_model == "openai/gpt-5.6-sol"
+    assert config.llm_model_list[0]["litellm_params"]["model"] == "openai/responses/gpt-5.6-sol"
+    assert config.llm_model_list[0]["model_info"]["dsa_api_surface"] == "responses"
+
+
+def test_litellm_status_skips_unknown_channel_api_surface() -> None:
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "litellm",
+            "LLM_CHANNELS": "draft",
+            "LLM_DRAFT_PROTOCOL": "openai",
+            "LLM_DRAFT_API_SURFACE": "respones",
+            "LLM_DRAFT_BASE_URL": "https://api.example.com/v1",
+            "LLM_DRAFT_API_KEY": "sk-draft",
+            "LLM_DRAFT_MODELS": "gpt-5.6-sol",
+        }
+    )
+
+    status = service.get_status()
+
+    assert status["primary"]["available"] is False
+    assert status["primary"]["last_error_code"] == "backend_not_configured"
+
+
+def test_litellm_status_skips_responses_surface_for_non_openai_protocol() -> None:
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "litellm",
+            "LLM_CHANNELS": "draft",
+            "LLM_DRAFT_PROTOCOL": "anthropic",
+            "LLM_DRAFT_API_SURFACE": "responses",
+            "LLM_DRAFT_API_KEY": "sk-draft",
+            "LLM_DRAFT_MODELS": "claude-sonnet-4-6",
+        }
+    )
+
+    status = service.get_status()
+
+    assert status["primary"]["available"] is False
+    assert status["primary"]["last_error_code"] == "backend_not_configured"
+
+
+def test_litellm_status_skips_openai_responses_channel_with_non_openai_model_provider() -> None:
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "litellm",
+            "LLM_CHANNELS": "draft",
+            "LLM_DRAFT_PROTOCOL": "openai",
+            "LLM_DRAFT_API_SURFACE": "responses",
+            "LLM_DRAFT_API_KEY": "sk-draft",
+            "LLM_DRAFT_MODELS": "anthropic/claude-sonnet-4-6",
+        }
+    )
+
+    status = service.get_status()
+
+    assert status["primary"]["available"] is False
+    assert status["primary"]["last_error_code"] == "backend_not_configured"
+
+
+def test_litellm_status_skips_openai_responses_channel_with_direct_provider_prefix() -> None:
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "litellm",
+            "LLM_CHANNELS": "draft",
+            "LLM_DRAFT_PROTOCOL": "openai",
+            "LLM_DRAFT_API_SURFACE": "responses",
+            "LLM_DRAFT_API_KEY": "sk-draft",
+            "LLM_DRAFT_MODELS": "xai/grok-beta",
+        }
+    )
+
+    status = service.get_status()
+
+    assert status["primary"]["available"] is False
+    assert status["primary"]["last_error_code"] == "backend_not_configured"
+
+
+def test_litellm_status_skips_duplicate_route_alias_with_mixed_surfaces() -> None:
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "litellm",
+            "LLM_CHANNELS": "chat,responses",
+            "LLM_CHAT_PROTOCOL": "openai",
+            "LLM_CHAT_API_KEY": "sk-chat",
+            "LLM_CHAT_MODELS": "gpt-5.6-sol",
+            "LLM_RESPONSES_PROTOCOL": "openai",
+            "LLM_RESPONSES_API_SURFACE": "responses",
+            "LLM_RESPONSES_API_KEY": "sk-responses",
+            "LLM_RESPONSES_MODELS": "gpt-5.6-sol",
+        }
+    )
+
+    status = service.get_status()
+
+    assert status["primary"]["available"] is False
+    assert status["primary"]["last_error_code"] == "backend_not_configured"
+
+
+def test_litellm_status_skips_unsupported_hermes_responses_surface() -> None:
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "litellm",
+            "LLM_CHANNELS": "hermes",
+            "LLM_HERMES_API_SURFACE": "responses",
+            "LLM_HERMES_API_KEY": "sk-hermes",
+        }
+    )
+
+    status = service.get_status()
+
+    assert status["primary"]["available"] is False
+    assert status["primary"]["last_error_code"] == "backend_not_configured"
+
+
+def test_public_effective_config_builder_preserves_smoke_overrides() -> None:
+    service = GenerationBackendStatusService(
+        effective_map={
+            "GENERATION_BACKEND": "litellm",
+            "GENERATION_BACKEND_TIMEOUT_SECONDS": "30",
+            "LITELLM_MODEL": "openai/gpt-4o-mini",
+            "OPENAI_API_KEY": "sk-test",
+        }
+    )
+
+    config = service.build_effective_config(
+        backend_id="codex_cli",
+        timeout_seconds=17,
+    )
+
+    assert config.generation_backend == "codex_cli"
+    assert config.generation_backend_timeout_seconds == 17
+    assert config.litellm_model == "openai/gpt-4o-mini"
